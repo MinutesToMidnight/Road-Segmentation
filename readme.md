@@ -8,4 +8,4 @@ The segmentation is done with U-net.
 
 To use the model on your computer create a python file, paste the code, download dataset, enter the path to the dataset folder,
 train the model. After that you can comment the training part, uncomment the displaying part (originally comented in the "code" file)
-and load the saved state of the model in order to see the results, choosing any image of the dataset via LoadData class variable and using show function.
+and load the saved state of the model in order to see the results, choosing any image of the dataset via LoadData variable and using show function.
