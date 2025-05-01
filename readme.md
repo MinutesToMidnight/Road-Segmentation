@@ -1,4 +1,5 @@
 The dataset of the road segmentation of 32 images. Defined 6 classes for cars, road, markings, signs, nature, background.
+Link to the dataset: https://www.kaggle.com/datasets/trainingdatapro/roads-segmentation-dataset?resource=download
 The segmentation is done with U-net.
 "code" contains code of the model with training and displaying the results.
 "images" contains original images
