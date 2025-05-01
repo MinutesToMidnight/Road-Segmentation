@@ -1,0 +1,236 @@
+import os
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torchvision.transforms.v2 as tfs_v2
+import torchvision.transforms.functional as tf
+from torch.utils.data import DataLoader, Dataset
+from PIL import Image
+import numpy as np
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+
+
+class LoadData(Dataset):
+    def __init__(self, path, colors=None, transform_img=None, transform_mask=None):
+        self.path = path
+        self.transform_img = transform_img
+        self.transform_mask = transform_mask
+        self.colors = colors
+        self.num_classes = len(colors) + 1
+
+        folder_img = path + "\\images"
+        folder_mask = path + "\\masks"
+
+        self.img_paths = [os.path.join(folder_img, img) for img in os.listdir(folder_img)]
+        self.mask_paths = [os.path.join(folder_mask, mask) for mask in os.listdir(folder_mask)]
+
+
+    def __getitem__(self, index):
+        path_img, path_mask = self.img_paths[index], self.mask_paths[index]
+        img, mask = Image.open(path_img).convert("RGB"), Image.open(path_mask).convert("RGB")
+
+
+        if self.transform_img:
+            # Crop the signature in the left bottom corner
+            img = tf.crop(self.transform_img(img), top=0, left=0, height=640, width=1280)
+
+        if self.transform_mask:
+            # Crop the signature in the left bottom corner
+            mask = tf.crop(self.transform_mask(mask), top=0, left=0, height=640, width=1280)
+            C, H, W = mask.shape
+            # Transform mask colors to channels (6)
+            mask_int = mask.to(torch.int32)
+            mask_int = mask_int.permute(1, 2, 0) # (H, W, C)
+            mask_int = mask_int.reshape(-1, mask_int.shape[2]) # (H*W, C)
+            allowed_colors = torch.tensor(list(self.colors.keys()), dtype=torch.int32)
+            # (1, H*W, C), (num_classes, 1, C) -> (H*W, num_classes)
+            matches = (mask_int.unsqueeze(1) == allowed_colors.unsqueeze(0)).all(dim=2)
+            matches = matches.to(torch.float32)
+            # Create one-hot vector for the classes
+            one_hot = torch.zeros((mask_int.shape[0], self.num_classes), dtype=torch.float32)
+            one_hot[:, :5] = matches
+            # Fill the unmasked part as background (0, 0, 0)/black at the last index
+            allowed_indices = matches.any(dim=1)
+            one_hot[~allowed_indices, 5] = 1.0
+            one_hot = one_hot.permute(1, 0)
+            mask = one_hot.reshape(self.num_classes, H, W)
+        return img, mask
+
+    def __len__(self):
+        return len(self.img_paths)
+
+
+class Unet(nn.Module):
+    # 2-layered Conv2d with BN
+    class _Conv2d(nn.Module):
+        def __init__(self, in_channels, out_channels):
+            super().__init__()
+            self.model = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, 3, padding="same", bias=False, stride=1),
+                nn.ReLU(inplace=True),
+                nn.BatchNorm2d(out_channels),
+                nn.Conv2d(out_channels, out_channels, 3, padding="same", bias=False, stride=1),
+                nn.ReLU(inplace=True),
+                nn.BatchNorm2d(out_channels)
+            )
+
+        def forward(self, x):
+            return self.model(x)
+
+    # Encoding CNN Layer
+    class CNNLayer(nn.Module):
+        def __init__(self, in_channels, out_channels):
+            super().__init__()
+            self.conv = Unet._Conv2d(in_channels, out_channels)
+            self.maxpool = nn.MaxPool2d(2, stride=2)
+
+        def forward(self, x):
+            x = self.conv(x)
+            y = self.maxpool(x)
+            return y, x
+
+    # Last Encoding CNN Layer
+    class BottleNeck(nn.Module):
+        def __init__(self, in_channels, out_channels):
+            super().__init__()
+            self.conv = Unet._Conv2d(in_channels, out_channels)
+
+        def forward(self, x):
+            return self.conv(x)
+
+    # Expand the image
+    class Decoder(nn.Module):
+        def __init__(self, in_channels, out_channels):
+            super().__init__()
+            self.transpose = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=2, stride=2, bias=True)
+            self.conv = Unet._Conv2d(in_channels, out_channels)
+
+        def forward(self, x, y):
+            x = self.transpose(x)
+            u = torch.concat([x, y], dim=1)
+            return self.conv(u)
+
+    def __init__(self, in_channels, num_classes):
+        super().__init__()
+        self.enc1 = self.CNNLayer(in_channels, 16)
+        self.enc2 = self.CNNLayer(16, 32)
+        self.enc3 = self.CNNLayer(32, 64)
+        self.enc4 = self.CNNLayer(64, 128)
+        self.enc5 = self.CNNLayer(128, 256)
+
+        self.bottleneck = self.BottleNeck(256, 512)
+
+        self.dec1 = self.Decoder(512, 256)
+        self.dec2 = self.Decoder(256, 128)
+        self.dec3 = self.Decoder(128, 64)
+        self.dec4 = self.Decoder(64, 32)
+        self.dec5 = self.Decoder(32, 16)
+        
+        # Process the last tensor and split in into num_classes channels
+        self.conv = nn.Conv2d(16, num_classes, 1, stride=1)
+
+    def forward(self, x):
+        x, y1 = self.enc1(x)
+        x, y2 = self.enc2(x)
+        x, y3 = self.enc3(x)
+        x, y4 = self.enc4(x)
+        x, y5 = self.enc5(x)
+
+        x = self.bottleneck(x)
+
+        x = self.dec1(x, y5)
+        x = self.dec2(x, y4)
+        x = self.dec3(x, y3)
+        x = self.dec4(x, y2)
+        x = self.dec5(x, y1)
+
+        return self.conv(x)
+
+# Display image
+def show(predict, colors):
+    predict = predict.squeeze(0)
+    predict_flat = predict.permute(1, 2, 0).reshape(-1, 6)
+    prob = nn.functional.softmax(predict_flat, dim=1)
+    indices = torch.argmax(prob, dim=1)  # shape: (640*1280,)
+    colors_keys = list(colors.keys()) + [(0, 0, 0)]
+    allowed_colors = torch.tensor(colors_keys, dtype=torch.int32)  # shape (6, 3)
+    rgb_values = allowed_colors[indices]  # shape: (640*1280, 3)
+    predict_img = rgb_values.reshape(640, 1280, 3)
+    predict_img = predict_img.detach().cpu().numpy().astype(np.int32)
+    plt.figure(figsize=(8, 6))
+    plt.imshow(predict_img)
+    plt.show()
+
+
+class SoftDiceLoss(nn.Module):
+    def __init__(self, smooth=1, pos_weight=None, T=1.0):
+        super().__init__()
+        self.smooth = smooth
+        self.pos_weight = pos_weight
+        self.T = T
+
+    def forward(self, logits, targets):
+        num, C, H, W = logits.shape
+        probs = nn.functional.softmax(logits, dim=1)
+        probs = probs.view(num, C, -1)
+        targets = targets.view(num, C, -1)
+        intersection = (probs * targets).sum(dim=2)
+        union = probs.sum(dim=2) + targets.sum(dim=2)
+        dice = (2 * intersection + self.smooth) / (union + self.smooth)
+        loss = 1 - dice
+        if self.pos_weight is not None:
+            loss = loss * self.pos_weight
+        return loss.mean()
+
+
+if __name__ == "__main__":
+    colors = {(255, 204, 51): "car", (221, 255, 51): "marks", (255, 53, 94): "signs",
+              (184, 61, 245): "nature",
+              (61, 61, 245): "road"}
+    transform_img = tfs_v2.Compose([tfs_v2.ToImage(), tfs_v2.ToDtype(torch.float32)])
+    transform_mask = tfs_v2.Compose([tfs_v2.ToImage(), tfs_v2.ToDtype(torch.float32)])
+    dataset = LoadData("E:\\Python\\Python Projects\\PycharmProjects", colors=colors,
+                 transform_img=transform_img, transform_mask=transform_mask)
+    num_classes = 6
+    train_set = DataLoader(dataset)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = Unet(3, 6)
+    optimizer = optim.Adam(params=model.parameters(), lr=1e-5, weight_decay=1e-5)
+    weights = torch.tensor([1.4, 1.0, 1.0, 1.0, 1.0, 1.0], dtype=torch.float32, device=device)
+    weights = weights.view(1, 6, 1, 1)
+    loss1 = SoftDiceLoss(smooth=1, pos_weight=weights)
+    loss2 = nn.BCEWithLogitsLoss(pos_weight=weights)
+    model.to(device)
+
+    epochs = 200
+    # Training
+    model.train()
+    for epoch in range(epochs):
+        train_tqdm = tqdm(train_set, leave=True)
+
+        for x_tr, y_tr in train_tqdm:
+            x_tr, y_tr = x_tr.to(device), y_tr.to(device)
+            predict = model(x_tr)
+            dice_loss = loss1(predict, y_tr)
+            bce_loss = loss2(predict, y_tr)
+            loss = dice_loss + bce_loss
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            train_tqdm.set_description(f"Epoch {epoch + 1}, Loss: {loss:.4f} Dice: {dice_loss:.4f} BCE: {bce_loss:.4f}")
+
+    state = model.state_dict()
+    torch.save(state, 'model_state_final.tar')
+
+    # Load saved state of the model and show the image
+    # state = torch.load('model_state_final.tar')
+    # model.load_state_dict(state)
+    # model.eval()
+    # img, mask = dataset[9]
+    # predict = model(img.unsqueeze(0))
+    # show(predict, colors)
+
+
